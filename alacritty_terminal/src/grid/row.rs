@@ -122,6 +122,14 @@ impl<T> Row<T> {
         self.inner.len()
     }
 
+    /// enzimOS: how many cells from the start may have been written since the
+    /// row was last reset. Every cell from here on is a reset cell with the
+    /// last cell's background.
+    #[inline]
+    pub fn occupied(&self) -> usize {
+        self.occ.min(self.inner.len())
+    }
+
     #[inline]
     pub fn last(&self) -> Option<&T> {
         self.inner.last()
