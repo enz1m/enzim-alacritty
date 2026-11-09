@@ -1147,6 +1147,62 @@ impl<T: EventListener> Handler for Term<T> {
         self.input_width(c, c.width());
     }
 
+    /// enzimOS: a run of printable ASCII written a row at a time, exactly as
+    /// one [`Self::input`] per character writes it. Insert mode, a mapping
+    /// charset, or a wide character among the cells written (whose removal
+    /// touches its neighbours) take the per-character path.
+    #[inline]
+    fn input_ascii(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() {
+            if self.mode.contains(TermMode::INSERT)
+                || self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
+            {
+                for c in text[start..].chars() {
+                    self.input(c);
+                }
+                return;
+            }
+            if self.grid.cursor.input_needs_wrap {
+                self.wrapline();
+            }
+            let columns = self.columns();
+            let point = self.grid.cursor.point;
+            let count = (bytes.len() - start).min(columns - point.column.0);
+            let end = point.column + count;
+            let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
+            if self.grid[point.line][point.column..end]
+                .iter()
+                .any(|cell| cell.flags.intersects(wide))
+            {
+                // Per character, as `input` does; the next row starts afresh.
+                let c = bytes[start] as char;
+                self.input(c);
+                start += 1;
+                continue;
+            }
+            let template = &self.grid.cursor.template;
+            let (fg, bg, flags, extra) =
+                (template.fg, template.bg, template.flags, template.extra.clone());
+            let cells = &mut self.grid[point.line][point.column..end];
+            for (cell, &byte) in cells.iter_mut().zip(&bytes[start..start + count]) {
+                cell.c = byte as char;
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.flags = flags;
+                cell.extra.clone_from(&extra);
+            }
+            start += count;
+            if end.0 < columns {
+                self.grid.cursor.point.column = end;
+            } else {
+                self.grid.cursor.point.column = Column(columns - 1);
+                self.grid.cursor.input_needs_wrap = true;
+            }
+        }
+    }
+
     #[inline]
     fn decaln(&mut self) {
         trace!("Decalnning");
@@ -3308,5 +3364,82 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    #[test]
+    fn ascii_runs_write_what_single_characters_write() {
+        use vte::ansi::{
+            CharsetIndex, Handler, Mode, NamedMode, NamedPrivateMode, PrivateMode, StandardCharset,
+        };
+        let run = |ops: &[(u8, u32)], bulk: bool| {
+            let mut term = Term::new(Config::default(), &TermSize::new(13, 6), VoidListener);
+            for &(op, arg) in ops {
+                match op {
+                    0 => {
+                        let text: String = (0..(arg % 40) + 1)
+                            .map(|i| (b'!' + ((arg + i) % 90) as u8) as char)
+                            .collect();
+                        if bulk {
+                            term.input_ascii(&text);
+                        } else {
+                            text.chars().for_each(|c| term.input(c));
+                        }
+                    },
+                    1 => term.input(['\u{4e16}', '\u{1f600}', '\u{e9}'][arg as usize % 3]),
+                    2 => term.goto((arg % 6) as i32, (arg / 6 % 13) as usize),
+                    3 => term.linefeed(),
+                    4 => term.carriage_return(),
+                    5 => {
+                        if arg % 2 == 0 {
+                            term.set_mode(Mode::Named(NamedMode::Insert));
+                        } else {
+                            term.unset_mode(Mode::Named(NamedMode::Insert));
+                        }
+                    },
+                    6 => term.configure_charset(
+                        CharsetIndex::G0,
+                        if arg % 3 == 0 {
+                            StandardCharset::SpecialCharacterAndLineDrawing
+                        } else {
+                            StandardCharset::Ascii
+                        },
+                    ),
+                    7 => {
+                        let wrap = PrivateMode::Named(NamedPrivateMode::LineWrap);
+                        if arg % 4 == 0 {
+                            term.unset_private_mode(wrap);
+                        } else {
+                            term.set_private_mode(wrap);
+                        }
+                    },
+                    _ => {
+                        term.set_scrolling_region(
+                            (arg % 3) as usize + 1,
+                            Some((arg % 3) as usize + 4),
+                        );
+                    },
+                }
+            }
+            let grid = term.grid();
+            let rows: Vec<Vec<Cell>> = (0..grid.screen_lines())
+                .map(|line| grid[crate::index::Line(line as i32)][..].to_vec())
+                .collect();
+            ((rows, grid.cursor.point, grid.cursor.input_needs_wrap), *term.mode())
+        };
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..200 {
+            let ops: Vec<(u8, u32)> = (0..120)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let op = state % 20;
+                    ((if op < 9 { 0 } else { op - 8 }).min(8) as u8, (state >> 16) as u32)
+                })
+                .collect();
+            let (bulk, single) = (run(&ops, true), run(&ops, false));
+            assert_eq!(bulk.0, single.0, "screens differ for {ops:?}");
+            assert_eq!(bulk.1, single.1);
+        }
     }
 }
